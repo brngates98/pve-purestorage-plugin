@@ -1700,33 +1700,40 @@ sub status {
   my $total;
   my $used;
 
-  # If using pod with quota, get pod-specific capacity
+  # Pod-backed stores: GET pods (not pods/space) — pods/space omits quota_limit and any
+  # capacity ceiling, which produced invalid total/free for REST consumers on current FA APIs.
   if ( defined $scfg->{ podname } && $scfg->{ podname } ne '' ) {
     my $podname = $scfg->{ podname };
-    $logger->( P_VERB, "Getting pod quota for pod: $podname", $scfg );
+    $logger->( P_VERB, "Getting pod capacity for pod: $podname", $scfg );
 
     my $action = {
-      name   => 'get pod space',
-      type   => 'pods/space',
+      name   => 'get pod',
+      type   => 'pods',
       method => 'GET',
       params => { names => $podname }
     };
     my $response = purestorage_api_call( $scfg, $action, 0, $storeid );
 
     my $pod = $response->{ items }->[0];
-    if ( $pod ) {
+    $fatal->( "Pod \"$podname\" not found", $scfg ) unless $pod;
 
-      # Use quota_limit if set and non-zero, otherwise fall back to array capacity
-      # quota_limit = 0 or undef means unlimited (no quota)
-      my $quota = $pod->{ quota_limit };
-      $total = ( defined( $quota ) && $quota > 0 ) ? $quota : $pod->{ capacity };
-      $used  = $pod->{ space }->{ total_physical };
+    my $space = $pod->{ space } // {};
+    my $quota = $pod->{ quota_limit };
 
-      my $quota_str = defined( $quota ) ? ( $quota > 0 ? $quota : 'unlimited' ) : 'not set';
-      $logger->( P_VERB, "Pod quota_limit: $quota_str", $scfg );
+    if ( defined( $quota ) && $quota > 0 ) {
+      $total = $quota;
+      # Pod quotas are logical (provisioned) limits on Purity 6.4+.
+      $used = $space->{ used_provisioned } // $space->{ total_used } // $space->{ total_physical } // 0;
     } else {
-      $fatal->( "Pod \"$podname\" not found", $scfg );
+      my $arr_response = purestorage_api_call( $scfg, { name => 'get array space', type => 'arrays/space', method => 'GET' }, 0, $storeid );
+      my $array = $arr_response->{ items }->[0];
+      $fatal->( 'PureStorage API :: No array space data', $scfg ) unless $array;
+      $total = $array->{ capacity } // 0;
+      $used  = $space->{ total_physical } // 0;
     }
+
+    my $quota_str = defined( $quota ) ? ( $quota > 0 ? $quota : 'unlimited' ) : 'not set';
+    $logger->( P_VERB, "Pod quota_limit: $quota_str", $scfg );
   } else {
 
     # Get array-wide capacity
@@ -1740,8 +1747,13 @@ sub status {
     $used = $array->{ space }->{ total_physical };
   }
 
-  # Calculate free space
+  $total //= 0;
+  $used  //= 0;
+  $used = $total if $used > $total;
+
+  # Calculate free space (clamp so REST/UI integrations never see negative free)
   my $free = $total - $used;
+  $free = 0 if $free < 0;
 
   # Mark storage as active
   my $active = 1;
