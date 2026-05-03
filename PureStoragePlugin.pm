@@ -1722,17 +1722,20 @@ sub status {
 
     if ( defined( $quota ) && $quota > 0 ) {
       $total = $quota;
+
       # Pod quotas are logical (provisioned) limits on Purity 6.4+.
       # Prefer total_used over deprecated total_physical on pod space (FA REST 2.x).
       $used = $space->{ used_provisioned } // $space->{ total_used } // $space->{ total_physical } // 0;
     } else {
       my $arr_response = purestorage_api_call( $scfg, { name => 'get array space', type => 'arrays/space', method => 'GET' }, 0, $storeid );
-      my $array = $arr_response->{ items }->[0];
+      my $array        = $arr_response->{ items }->[0];
       $fatal->( 'PureStorage API :: No array space data', $scfg ) unless $array;
       unless ( defined $array->{ capacity } ) {
         $logger->( P_WARN, 'arrays/space response missing capacity; reporting total as 0', $scfg );
       }
+
       $total = $array->{ capacity } // 0;
+
       # Same scope as non-pod status: capacity and usage both from arrays/space (array-wide).
       my $arr_space = $array->{ space } // {};
       $used = $arr_space->{ total_used } // $arr_space->{ total_physical } // 0;
@@ -1749,6 +1752,7 @@ sub status {
     unless ( defined $array->{ capacity } ) {
       $logger->( P_WARN, 'arrays/space response missing capacity; reporting total as 0', $scfg );
     }
+
     $total = $array->{ capacity } // 0;
 
     # Prefer total_used (FA REST 2.x); total_physical deprecated for same metric on newer arrays.
