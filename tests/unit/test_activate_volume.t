@@ -20,7 +20,11 @@ my $connected_now = 1;    # what the array connection says: 1 created now, 0 it 
   no warnings 'redefine';
   no strict 'refs';
   *{ "${pkg}::purestorage_volume_connection" } = sub { push @events, 'array connect'; return $connected_now };
-  *{ "${pkg}::map_volume" }                    = sub { push @events, 'map';           die $map_error      if $map_error;      return '/dev/x' };
+  *{ "${pkg}::map_volume" } = sub {
+    push @events, 'map';
+    die $map_error if $map_error;
+    return wantarray ? ( '/dev/x', '3624a9370deadbeef' ) : '/dev/x';
+  };
   *{ "${pkg}::deactivate_volume" }             = sub { push @events, 'deactivate';    die $rollback_error if $rollback_error; return 1 };
 }
 

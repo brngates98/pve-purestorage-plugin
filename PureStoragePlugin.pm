@@ -231,6 +231,12 @@ sub properties {
       minimum     => 30,
       default     => 60
     },
+    'san-multipath' => {
+      description =>
+        "Register volume WWIDs in the cluster multipath configuration (Proxmox VE 9.3+) so Datacenter → SAN can manage them. Default off; host multipath connect and teardown stay with the plugin.",
+      type    => 'boolean',
+      default => 'no'
+    },
   };
 }
 
@@ -249,6 +255,7 @@ sub options {
     debug                => { optional => 1 },
     pgroup_sync          => { optional => 1 },
     pgroup_sync_interval => { optional => 1 },
+    'san-multipath'      => { optional => 1 },
     nodes                => { optional => 1 },
     disable              => { optional => 1 },
     content              => { optional => 1 },
@@ -576,6 +583,81 @@ sub multipath_remove_map {
   my ( $wwid, $timeout ) = @_;
 
   multipathd_map_retry( 'remove', $wwid, 'to be released', $timeout );
+}
+
+# Proxmox VE 9.3+ cluster multipath.cfg: third-party plugins need explicit WWID entries (built-in
+# iSCSI uses managed-multipath). Opt-in via san-multipath; host map add/remove stays in this plugin.
+sub san_multipath_config_available {
+  return eval { require PVE::Multipath::Config; PVE::Multipath::Config->can('lock_config') && PVE::Multipath::Config->can('write_cluster_config') };
+}
+
+sub san_multipath_register_wwid {
+  my ( $class, $wwid, $scfg ) = @_;
+
+  return 0 unless $scfg && $scfg->{'san-multipath'};
+  return 0 unless defined($wwid) && length($wwid);
+  return 0 unless san_multipath_config_available();
+
+  my $ok = eval {
+    PVE::Multipath::Config::lock_config(
+      sub {
+        my $cfg = PVE::Multipath::Config::read_config();
+        $cfg->{ ids } //= {};
+        return if $cfg->{ ids }->{$wwid};
+        $cfg->{ ids }->{$wwid} = { type => 'wwid' };
+        PVE::Multipath::Config::write_cluster_config($cfg);
+      }
+    );
+    1;
+  };
+  if ( !$ok ) {
+    $logger->( P_WARN, "Failed to register multipath WWID \"$wwid\": $@", $scfg );
+    return 0;
+  }
+  return 1;
+}
+
+sub san_multipath_unregister_wwid {
+  my ( $class, $wwid, $scfg ) = @_;
+
+  return 0 unless $scfg && $scfg->{'san-multipath'};
+  return 0 unless defined($wwid) && length($wwid);
+  return 0 unless san_multipath_config_available();
+
+  my $ok = eval {
+    PVE::Multipath::Config::lock_config(
+      sub {
+        my $cfg = PVE::Multipath::Config::read_config();
+        $cfg->{ ids } //= {};
+        return unless $cfg->{ ids }->{$wwid};
+        delete $cfg->{ ids }->{$wwid};
+        PVE::Multipath::Config::write_cluster_config($cfg);
+      }
+    );
+    1;
+  };
+  if ( !$ok ) {
+    $logger->( P_WARN, "Failed to unregister multipath WWID \"$wwid\": $@", $scfg );
+    return 0;
+  }
+  return 1;
+}
+
+# Best-effort only: never fail alloc/clone/activate because SAN registration failed.
+sub san_multipath_register_volume {
+  my ( $class, $scfg, $volname ) = @_;
+
+  return 0 unless $scfg && $scfg->{'san-multipath'};
+  my $wwid = eval {
+    my ( undef, $id ) = $class->purestorage_get_wwn( $scfg, $volname );
+    $id;
+  };
+  if ( $@ ) {
+    $logger->( P_WARN, "Cannot resolve WWID of volume \"$volname\" for SAN registration: $@", $scfg );
+    return 0;
+  }
+  return 0 unless length( $wwid // '' );
+  return $class->san_multipath_register_wwid( $wwid, $scfg );
 }
 
 sub get_device_path_wwn {
@@ -1561,7 +1643,7 @@ sub purestorage_create_volume {
   my $serial = $response->{ items }->[0]->{ serial } or $fatal->( "Failed to retrieve volume serial", $scfg );
   $logger->( P_INFO, "Volume \"$volname\" is created (serial=$serial).", $scfg );
 
-  return 1;
+  return $serial;
 }
 
 sub purestorage_remove_volume {
@@ -1576,8 +1658,9 @@ sub purestorage_remove_volume {
 
   # Clean up local device mappings before removing from Pure Storage
   my $volume = $class->purestorage_get_volume_info( $scfg, $volname, $storeid, 0 );
-  if ( $volume && $volume->{ serial } ) {
-    my ( $path, $wwid ) = get_device_path_wwn( $volume->{ serial } );
+  my $serial = $volume ? ( $volume->{ serial } // '' ) : '';
+  if ( length($serial) ) {
+    my ( $path, $wwid ) = get_device_path_wwn($serial);
 
     if ( $wwid ne '' && -e "/dev/mapper/$wwid" ) {
       $logger->( P_DEBUG, "Cleaning up local device mappings for $wwid", $scfg );
@@ -1675,7 +1758,8 @@ sub purestorage_remove_volume {
     $logger->( P_INFO, "Volume \"$volname\" is eradicated.", $scfg );
   }
 
-  return 1;
+  # Serial when known (for SAN multipath unregister after destroy); otherwise empty string.
+  return $serial;
 }
 
 sub purestorage_resize_volume {
@@ -2480,6 +2564,7 @@ sub clone_image {
   my $name = $class->find_free_diskname( $storeid, $scfg, $vmid );
 
   $class->purestorage_volume_restore( $scfg, $storeid, $name, $volname, $snap, undef, $class->purestorage_exact_snap_name( $scfg, $storeid, $volname, $snap ) );
+  $class->san_multipath_register_volume( $scfg, $name );
 
   return $name;
 }
@@ -2520,8 +2605,18 @@ sub alloc_image {
   # Convert size from KB to bytes
   my $sizeB = $size * 1024;    # KB => B
 
-  if ( !$class->purestorage_create_volume( $scfg, $name, $sizeB, $storeid ) ) {
+  my $serial = $class->purestorage_create_volume( $scfg, $name, $sizeB, $storeid );
+  if ( !$serial ) {
     $fatal->( "Failed to create volume \"$name\"", $scfg );
+  }
+
+  if ( $scfg->{'san-multipath'} ) {
+    my ( undef, $wwid ) = eval { get_device_path_wwn($serial) };
+    if ( $@ ) {
+      $logger->( P_WARN, "Cannot derive WWID for volume \"$name\" after create: $@", $scfg );
+    } else {
+      $class->san_multipath_register_wwid( $wwid, $scfg );
+    }
   }
 
   return $name;
@@ -2531,9 +2626,21 @@ sub free_image {
   my ( $class, $storeid, $scfg, $volname, $isBase ) = @_;
   $logger->( P_DEBUG, "free_image", $scfg );
 
+  # Resolve WWID before deactivate/remove while the volume still answers on the array.
+  my $wwid;
+  if ( $scfg->{'san-multipath'} ) {
+    ( undef, $wwid ) = eval { $class->purestorage_get_wwn( $scfg, $volname ) };
+    $logger->( P_WARN, "Cannot resolve WWID of volume \"$volname\" before remove: $@", $scfg ) if $@;
+  }
+
   $class->deactivate_volume( $storeid, $scfg, $volname );
 
-  $class->purestorage_remove_volume( $scfg, $volname, $storeid );
+  my $serial = $class->purestorage_remove_volume( $scfg, $volname, $storeid );
+  if ( !length( $wwid // '' ) && length( $serial // '' ) ) {
+    ( undef, $wwid ) = eval { get_device_path_wwn($serial) };
+    $logger->( P_WARN, "Cannot derive WWID from serial after remove of \"$volname\": $@", $scfg ) if $@;
+  }
+  $class->san_multipath_unregister_wwid( $wwid, $scfg ) if length( $wwid // '' );
 
   return undef;
 }
@@ -2758,7 +2865,7 @@ sub map_volume {
     };
     wait_for( $multipath_ready, "multipath map for volume \"$volname\" to be ready", 30 );
   }
-  return $path;
+  return wantarray ? ( $path, $wwid ) : $path;
 }
 
 # PVE::Storage::unmap_volume calls this with a snapshot name as the fourth argument: the signature stays.
@@ -2855,7 +2962,14 @@ sub activate_volume {
   # PVE does not undo a failed activation: deactivate here, so that the connection on the array and the paths of
   # a half-mapped volume do not stay behind. Only when this call connected the volume: one that was connected before
   # may be in use (a running guest holds its multipath device), and removing it would take the disk from the guest.
-  unless ( eval { $class->map_volume( $storeid, $scfg, $volname, $snapname, $hints ); 1 } ) {
+  my $wwid;
+  unless (
+    eval {
+      ( undef, $wwid ) = $class->map_volume( $storeid, $scfg, $volname, $snapname, $hints );
+      1;
+    }
+    )
+  {
     my $error = $@;
     if ( $connected_now ) {
       eval { $class->deactivate_volume( $storeid, $scfg, $volname, $snapname, $cache ) };
@@ -2865,6 +2979,11 @@ sub activate_volume {
     }
     die $error;
   }
+
+  # Lazy adopt for volumes created before san-multipath was enabled (or on older plugin versions).
+  # Use the WWID from map_volume so activation does not call the array again for registration.
+  $class->san_multipath_register_wwid( $wwid, $scfg ) if length( $wwid // '' );
+
   return 1;
 }
 

@@ -3,7 +3,7 @@
 > [!TIP]
 > If you are using a cluster setup - this step needs to be executed only on one node of the cluster - corosync will do the rest for you.
 
-After installing the plugin, you need to configure Proxmox VE to use it. Since Proxmox VE does not currently support adding custom storage plugins via the GUI, you will need to open shell and use `pvesm` command to add it:
+After installing the plugin, configure Proxmox VE to use it. On Proxmox VE 9.3 or later you can add and edit the storage in the web UI under Datacenter → Storage (the form comes from the plugin property schema). On older versions, use the shell and `pvesm`:
 
 ```bash
 pvesm add purestorage <storage_id> \
@@ -46,6 +46,7 @@ purestorage: <storage_id>
 | debug | (`optional`, default is `0`) Debug level 0 to 3 (off, basic, verbose, trace); `PURESTORAGE_DEBUG` is the fallback when it is not set. See [troubleshooting](troubleshooting.md#debug-logging). |
 | pgroup_sync | (`optional`, default is `no`) Import Pure protection-group snapshots into QEMU VM snapshot trees. Off by default. See [Protection-group snapshot sync](#protection-group-snapshot-sync). |
 | pgroup_sync_interval | (`optional`, default is `60`) Minimum seconds between protection-group snapshot sync runs (minimum 30). Only used when `pgroup_sync` is enabled. |
+| san-multipath | (`optional`, default is `no`) On Proxmox VE 9.3+, register each volume WWID in the cluster multipath configuration so Datacenter → SAN can show the LUN as managed. Off by default. See [SAN multipath registration](#san-multipath-registration). |
 
 > **_NOTE:_** Ensure that the token and other sensitive information are kept secure and not exposed publicly.
 
@@ -58,6 +59,20 @@ purestorage: pure-cluster
   vgname pure_vg
   content images
 ```
+
+## SAN multipath registration
+
+Proxmox VE 9.3 adds cluster-wide multipath management and a Datacenter → SAN view. Built-in iSCSI storages can supply LUN WWIDs with their `managed-multipath` option; third-party plugins need an explicit entry per WWID in `/etc/pve/multipath.cfg`.
+
+With `san-multipath` enabled, the plugin registers a volume's WWID when the volume is created, cloned, or activated, and removes the entry when the volume is deleted. Host-side connect, SCSI scan, `multipathd add` / `remove`, and array disconnect stay as they are. On Proxmox VE without the multipath configuration API the setting is accepted but registration is a no-op.
+
+Enable it on a storage:
+
+```bash
+pvesm set <storage_id> --san-multipath 1
+```
+
+Existing volumes are adopted the next time they are activated (lazy registration). Auto-registered entries do not set `paths-expected`, because a Pure volume is only connected on nodes that activated it; other nodes may show the LUN as Missing in the SAN view without multipath notifications. Datacenter → SAN reports about 700 LUNs per node before falling back to Node → SAN only, so large estates should treat this as opt-in observability rather than registering every idle volume by hand.
 
 ## Linux containers (LXC)
 

@@ -28,6 +28,7 @@ perl tests/unit/test_token_cache.t
 | `test_device_paths.t` | paths of a volume found by WWID, one list of paths for resize and unmap even when the by-id link points at a single path, sysfs read under one root |
 | `test_multipath_remove.t` | `multipathd remove map` is retried quietly until the map is released, a map that stays held is an error |
 | `test_multipath_resize.t` | `multipathd resize map` is retried until the map accepts it, a map that never does is an error |
+| `test_san_multipath.t` | opt-in `san-multipath` registers WWIDs in the cluster multipath config on alloc/activate, unregisters on free, skips when the flag is off, omits `paths-expected` |
 | `test_pgroup_names.t` | snapshot name sanitizing (also for groups in a pod), names of colliding and long groups (at most 40 characters), parent and description parsing, skipping PVE-created snapshots |
 | `test_pgroup_snapshot_sync.t` | snapshot entries built from a VM config without drives added after the snapshot, importing a group without taking over a snapshot of the user, parents after a removed snapshot |
 | `test_sync_children.t` | the finished runs of the sync are reaped, a run that still works and a child of another part of the daemon are left alone |
